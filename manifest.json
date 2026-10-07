@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "id": "io.github.proadmin.systemd-ease",
+  "id": "io.github.pro-termux-arch.systemd-ease",
   "name": "Systemd Ease",
   "version": "1.0.0",
   "author": "local",

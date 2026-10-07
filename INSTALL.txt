@@ -18,7 +18,7 @@ Remove with ./uninstall.sh.
 
 FILES
   install.sh / uninstall.sh .. one-command setup / removal
-  manifest.json .............. plugin contract (id: io.github.proadmin.systemd-ease)
+  manifest.json .............. plugin contract (id: io.github.pro-termux-arch.systemd-ease)
   BarWidget.qml .............. bar icon + crash badge
   Panel.qml .................. service list / logs / boot-times
   Wizard.qml ................. guided service creator

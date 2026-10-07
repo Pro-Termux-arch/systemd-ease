@@ -24,15 +24,15 @@ Options: `./install.sh --section left` to choose the bar section,
 If you'd rather do it by hand:
 
 ```sh
-cp -r . ~/.config/omarchy/plugins/io.github.proadmin.systemd-ease
-omarchy plugin validate ~/.config/omarchy/plugins/io.github.proadmin.systemd-ease
+cp -r . ~/.config/omarchy/plugins/io.github.pro-termux-arch.systemd-ease
+omarchy plugin validate ~/.config/omarchy/plugins/io.github.pro-termux-arch.systemd-ease
 omarchy-shell shell rescanPlugins
-omarchy plugin enable io.github.proadmin.systemd-ease
-omarchy bar put io.github.proadmin.systemd-ease --section right
+omarchy plugin enable io.github.pro-termux-arch.systemd-ease
+omarchy bar put io.github.pro-termux-arch.systemd-ease --section right
 omarchy restart shell
 ```
 
-To remove: `omarchy plugin remove io.github.proadmin.systemd-ease`,
+To remove: `omarchy plugin remove io.github.pro-termux-arch.systemd-ease`,
 then `omarchy restart shell`.
 
 ## What you can do
@@ -100,9 +100,9 @@ Omarchy `Style`/`Color`/bar tokens, so it follows your theme with zero config.
 ## Scripting (IPC)
 
 ```sh
-omarchy-shell io.github.proadmin.systemd-ease toggle   # open/close the panel
-omarchy-shell io.github.proadmin.systemd-ease status   # e.g. "0 failed"
-omarchy-shell io.github.proadmin.systemd-ease refresh  # refresh the bar badge
+omarchy-shell io.github.pro-termux-arch.systemd-ease toggle   # open/close the panel
+omarchy-shell io.github.pro-termux-arch.systemd-ease status   # e.g. "0 failed"
+omarchy-shell io.github.pro-termux-arch.systemd-ease refresh  # refresh the bar badge
 ```
 
 ## Requirements

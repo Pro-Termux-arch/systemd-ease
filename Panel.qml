@@ -12,7 +12,7 @@ import "Model.js" as Model
 //   create — the guided service creator (Wizard.qml)
 Panel {
   id: root
-  moduleName: "io.github.proadmin.systemd-ease"
+  moduleName: "io.github.pro-termux-arch.systemd-ease"
   manageIpc: false
 
   property var anchorItem: null

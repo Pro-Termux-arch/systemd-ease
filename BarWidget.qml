@@ -8,7 +8,7 @@ import qs.Ui
 // manager panel; the panel (not this widget) owns the heavy lifting.
 BarWidget {
   id: root
-  moduleName: "io.github.proadmin.systemd-ease"
+  moduleName: "io.github.pro-termux-arch.systemd-ease"
 
   readonly property string bridgePath: String(Qt.resolvedUrl("bin/systemd-ease")).replace(/^file:\/\//, "")
   property int failedCount: 0
@@ -78,7 +78,7 @@ BarWidget {
   }
 
   IpcHandler {
-    target: "io.github.proadmin.systemd-ease"
+    target: "io.github.pro-termux-arch.systemd-ease"
 
     function open(): void { root.open() }
     function close(): void { root.close() }
