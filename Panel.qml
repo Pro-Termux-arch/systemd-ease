@@ -142,8 +142,21 @@ Panel {
   }
 
   function copyText(t, what) {
+    // Only short, non-sensitive identifiers travel here (unit names, file
+    // paths). Full journal text is NEVER passed as process arguments — it
+    // would leak to other local users via process listings. Logs go through
+    // copyLogs() below, which pipes them over stdin inside the backend.
     Util.execArgv(["wl-copy", String(t)])
     showToast((what || "Copied") + " ✓ — paste it anywhere")
+  }
+
+  // Clipboard for journal text: the backend re-reads the journal and pipes
+  // it straight into wl-copy's stdin. Nothing sensitive touches argv.
+  function copyLogs() {
+    if (copyProc.running || !logUnit) return
+    busy = true
+    copyProc.command = [bridgePath, "copy-logs", logUnit, logScope]
+    copyProc.running = true
   }
 
   function openPath(path) {
@@ -251,6 +264,20 @@ Panel {
         }
       }
     }
+  }
+  Process {
+    id: copyProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.busy = false
+        var d = null
+        try { d = JSON.parse(String(text)) } catch (e) { d = null }
+        if (d && d.ok) root.showToast("Logs copied ✓ — paste them anywhere")
+        else root.showToast("Couldn't copy: " + ((d && d.error) || "unknown error"))
+      }
+    }
+    onExited: root.busy = false
   }
   Process {
     id: blameProc
@@ -719,7 +746,7 @@ Panel {
             Button { text: "Save to file"; fontSize: Style.font.caption; foreground: root.fg; fontFamily: root.family; bordered: true
               onClicked: root.saveLogs() }
             Button { text: "Copy"; fontSize: Style.font.caption; foreground: root.fg; fontFamily: root.family; bordered: true
-              onClicked: root.copyText(root.logText, "Logs copied") }
+              onClicked: root.copyLogs() }
             Button { text: "Open file"; fontSize: Style.font.caption; foreground: root.fg; fontFamily: root.family; bordered: true
               visible: root.lastSaved !== ""; onClicked: root.openPath(root.lastSaved) }
           }

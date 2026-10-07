@@ -84,6 +84,12 @@ hand the file to your AI agent. It contains everything needed to diagnose.
   polkit dialog — the plugin never stores it.
 - Destructive actions (delete, block, boot-off for system services) ask for
   confirmation first.
+- Clipboard safety: journal text is piped to the clipboard over stdin, never
+  passed as process arguments (arguments are visible to other local users via
+  process listings).
+- Watchdog setup never replaces timer/service files it didn't create (every
+  file it owns carries a marker comment), and never truncates an existing
+  watchdog diary — re-created services append under a new banner.
 - Everything the plugin creates lives in `~/.config/systemd/user/` (no root
   needed) except the optional debug folder in `~/Documents/`.
 
