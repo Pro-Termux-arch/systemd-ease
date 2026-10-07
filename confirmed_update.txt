@@ -1,0 +1,16 @@
+PUSH CONFIRMED ✅
+==================
+
+Yes — this repository is pushed and up to date on GitHub:
+https://github.com/Pro-Termux-arch/systemd-ease
+
+- Latest commit: d18ca22 "Security fixes: stdin-pipe clipboard, watchdog file ownership + diary preservation"
+- Branch: main (linear history, in sync with local)
+- Verified: backend file pulled back from GitHub raw and confirmed to contain
+  the security fixes (copy-logs stdin pipe, watchdog ownership markers,
+  diary preservation).
+- Plugin ID: io.github.pro-termux-arch.systemd-ease
+- Status: resubmitted for Omarchy marketplace review.
+
+Checked: 2026-10-07 by the dev agent. If you can read this on github.com,
+the push definitely worked.
