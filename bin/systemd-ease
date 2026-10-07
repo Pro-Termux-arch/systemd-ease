@@ -1,0 +1,746 @@
+#!/usr/bin/env python3
+"""systemd-ease backend bridge for the Omarchy Systemd Ease plugin.
+
+One command per argv invocation, machine-readable output on stdout
+(JSON for everything except `logs` / `blame` / `status-text` which are
+plain text). Never prompts, never opens a GUI itself.
+
+Commands:
+  list                        JSON array of all services (system + user scopes)
+  failed-count                JSON {failed, failedNames[]} (cheap, for bar badge)
+  action OP UNIT SCOPE        start|stop|restart|enable|disable|mask|unmask|daemon-reload
+  status UNIT SCOPE            JSON {active, enabled, text}
+  logs UNIT SCOPE [N]          last N journal lines (plain text)
+  save-logs UNIT SCOPE PATH   write journal to PATH, JSON result
+  apps                        JSON array of installed GUI apps (.desktop files)
+  create ...                  create a user service (see --help)
+  delete UNIT SCOPE            stop+disable+remove unit file (refuses vendor units)
+  watchdog-check NAME          watchdog tick for a managed service
+  watchdog-log NAME            contents of the watchdog data file
+  blame [--user]               slowest units at boot (plain text)
+"""
+
+import glob
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+HOME = os.path.expanduser("~")
+USER_UNIT_DIR = os.path.join(HOME, ".config", "systemd", "user")
+DOCS_DIR = os.path.join(HOME, "Documents")
+MARKER = "Managed-By: systemd-ease"
+
+VALID_OPS = ("start", "stop", "restart", "enable", "disable",
+             "mask", "unmask", "daemon-reload")
+VALID_SCOPES = ("system", "user")
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]*$")
+
+
+def scope_args(scope):
+    return ["--user"] if scope == "user" else []
+
+
+def run(cmd, timeout=30):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout)
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(cmd, 127, "", "command not found")
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(cmd, 124, "", "timed out")
+
+
+def ok(data):
+    print(json.dumps(data))
+    return 0
+
+
+def fail(msg):
+    print(json.dumps({"ok": False, "error": msg}))
+    return 0
+
+
+# ---------------------------------------------------------------- list
+
+SHOW_PROPS = ("Id,LoadState,ActiveState,SubState,UnitFileState,"
+              "FragmentPath,Description")
+
+
+def parse_show(scope):
+    """All in-memory service units for one scope via a single systemctl call."""
+    out = {}
+    p = run(["systemctl"] + scope_args(scope) +
+            ["show", "--type=service", "--all", "--property=" + SHOW_PROPS,
+             "--no-pager"])
+    if p.returncode != 0:
+        return out
+    cur = {}
+    def flush():
+        if cur.get("Id", "").endswith(".service"):
+            out[cur["Id"]] = cur.copy()
+    for line in p.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            flush()
+            cur = {}
+            continue
+        if "=" in line:
+            k, v = line.split("=", 1)
+            cur[k] = v
+    flush()
+    return out
+
+
+def parse_unit_files(scope):
+    """All installed unit files for one scope (covers never-loaded ones)."""
+    out = {}
+    p = run(["systemctl"] + scope_args(scope) +
+            ["list-unit-files", "--type=service", "--no-legend", "--no-pager"])
+    if p.returncode != 0:
+        return out
+    for line in p.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        name, state = parts[0], parts[1].rstrip(",")
+        if not name.endswith(".service"):
+            continue
+        out[name] = state
+    return out
+
+
+def classify_origin(fragment):
+    frag = fragment or ""
+    if frag.startswith(HOME):
+        return "mine"
+    if frag.startswith("/etc/") or frag.startswith("/run/"):
+        return "custom"
+    return "vendor"  # /usr/lib, /usr/share, empty, generated, ...
+
+
+def is_managed_user_unit(name, fragment):
+    """True when the unit file was written by `create` (marker comment)."""
+    try:
+        if not fragment or not fragment.startswith(USER_UNIT_DIR):
+            return False
+        if os.path.basename(fragment) != name:
+            return False
+        with open(fragment, "r", errors="replace") as f:
+            head = f.read(2048)
+        return MARKER in head
+    except OSError:
+        return False
+
+
+def cmd_list():
+    units = []
+    for scope in ("system", "user"):
+        shown = parse_show(scope)
+        files = parse_unit_files(scope)
+        for name, state in files.items():
+            if name not in shown:
+                shown[name] = {"Id": name, "LoadState": "unloaded",
+                               "ActiveState": "inactive", "SubState": "dead",
+                               "UnitFileState": state, "FragmentPath": "",
+                               "Description": ""}
+        for name, u in shown.items():
+            frag = u.get("FragmentPath", "")
+            origin = classify_origin(frag)
+            managed = (scope == "user"
+                       and is_managed_user_unit(name, frag))
+            if managed:
+                origin = "mine"
+            units.append({
+                "name": name,
+                "scope": scope,
+                "load": u.get("LoadState", ""),
+                "active": u.get("ActiveState", "inactive"),
+                "sub": u.get("SubState", "dead"),
+                "enabled": u.get("UnitFileState", ""),
+                "description": u.get("Description", ""),
+                "fragment": frag,
+                "origin": origin,          # vendor | custom | mine
+                "managed": managed,        # created by this plugin
+                "deletable": managed or (
+                    bool(frag) and not frag.startswith("/usr/")
+                    and frag.startswith(("/etc/", HOME))),
+            })
+    # Failed first, then running, then alphabetical — beginners see fires first.
+    def key(u):
+        failed = 0 if u["active"] == "failed" else 1
+        running = 0 if u["active"] == "active" else 1
+        return (failed, running, u["scope"], u["name"])
+    units.sort(key=key)
+    return ok(units)
+
+
+def cmd_failed_count():
+    failed = []
+    for scope in ("system", "user"):
+        p = run(["systemctl"] + scope_args(scope) +
+                ["list-units", "--type=service", "--state=failed",
+                 "--plain", "--no-legend", "--no-pager"])
+        for line in p.stdout.splitlines():
+            name = line.split(None, 1)[0] if line.split() else ""
+            if name.endswith(".service"):
+                failed.append({"name": name, "scope": scope})
+    return ok({"failed": len(failed), "failedNames": failed})
+
+
+# ---------------------------------------------------------------- action
+
+AUTH_HINTS = ("access denied", "permission denied", "not authorized",
+              "interactive authentication", "interaction not allowed")
+
+
+def systemctl_action(op, unit, scope):
+    base = ["systemctl"] + scope_args(scope)
+    if op == "daemon-reload":
+        return run(base + ["daemon-reload"])
+    return run(base + [op, unit])
+
+
+def cmd_action(op, unit, scope):
+    if op not in VALID_OPS:
+        return fail("Unknown operation: %s" % op)
+    if scope not in VALID_SCOPES:
+        return fail("Scope must be system or user")
+    if op != "daemon-reload" and not unit.endswith((".service", ".timer")):
+        return fail("Only service/timer units are managed")
+    p = systemctl_action(op, unit, scope)
+    if p.returncode != 0 and scope == "system":
+        err = (p.stderr or "").lower()
+        if any(h in err for h in AUTH_HINTS) or p.returncode in (1, 4):
+            # Retry with privilege escalation; the Omarchy polkit agent
+            # shows the password dialog for this.
+            args = ["daemon-reload"] if op == "daemon-reload" else [op, unit]
+            p2 = run(["pkexec", "systemctl"] + args)
+            if p2.returncode == 0:
+                return ok({"ok": True, "op": op, "unit": unit,
+                           "scope": scope, "elevated": True,
+                           "message": "%s %s (with password prompt)" % (op, unit)})
+            return fail("Failed even with password prompt: %s"
+                        % ((p2.stderr or "").strip() or "unknown error"))
+    if p.returncode == 0:
+        return ok({"ok": True, "op": op, "unit": unit, "scope": scope,
+                   "message": "%s %s" % (op, unit)})
+    return fail(((p.stderr or "").strip().splitlines() or ["failed"])[0][:300])
+
+
+# ---------------------------------------------------------------- status / logs
+
+def cmd_status(unit, scope):
+    if scope not in VALID_SCOPES:
+        return fail("Scope must be system or user")
+    args = scope_args(scope)
+    a = run(["systemctl"] + args + ["is-active", unit])
+    e = run(["systemctl"] + args + ["is-enabled", unit])
+    s = run(["systemctl"] + args + ["status", unit, "--no-pager", "--lines=0"])
+    return ok({"ok": True, "unit": unit, "scope": scope,
+               "active": (a.stdout or "").strip(),
+               "enabled": (e.stdout or "").strip(),
+               "text": s.stdout or s.stderr or ""})
+
+
+def journal_lines(unit, scope, n):
+    args = ["journalctl"]
+    if scope == "user":
+        args.append("--user")
+    args += ["-u", unit, "-n", str(n), "--no-pager", "--no-hostname"]
+    p = run(args, timeout=20)
+    return (p.stdout or p.stderr or "").strip()
+
+
+def cmd_logs(unit, scope, n="200"):
+    try:
+        n = max(10, min(2000, int(n)))
+    except ValueError:
+        n = 200
+    text = journal_lines(unit, scope, n)
+    sys.stdout.write(text + ("\n" if text and not text.endswith("\n") else ""))
+    return 0
+
+
+def cmd_save_logs(unit, scope, path):
+    if scope not in VALID_SCOPES:
+        return fail("Scope must be system or user")
+    path = os.path.abspath(os.path.expanduser(path))
+    if not (path.startswith(HOME) or path.startswith("/tmp/")):
+        return fail("Logs can only be saved inside your home or /tmp")
+    try:
+        text = journal_lines(unit, scope, 1000)
+        with open(path, "w") as f:
+            f.write("Logs for %s (%s scope), saved %s\n\n"
+                    % (unit, scope, datetime.now().isoformat(timespec="seconds")))
+            f.write(text + "\n")
+    except OSError as e:
+        return fail("Could not write file: %s" % e)
+    return ok({"ok": True, "path": path})
+
+
+# ---------------------------------------------------------------- apps
+
+DESKTOP_DIRS = ("/usr/share/applications",
+                "/usr/local/share/applications",
+                os.path.join(HOME, ".local/share/applications"),
+                "/var/lib/flatpak/exports/share/applications",
+                os.path.join(HOME, ".local/share/flatpak/exports/share/applications"))
+
+FIELD_CODES = re.compile(r"\s*%[fFuUdDnNickvm]\b|\s*%[fFuU]\s*")
+
+
+def parse_desktop(path):
+    info = {}
+    try:
+        with open(path, "r", errors="replace") as f:
+            in_entry = False
+            for raw in f:
+                line = raw.strip()
+                if line.startswith("["):
+                    in_entry = (line == "[Desktop Entry]")
+                    continue
+                if not in_entry or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k in ("Name", "Exec", "Icon", "Terminal", "NoDisplay",
+                         "Hidden", "Type", "Comment"):
+                    info[k] = v.strip()
+    except OSError:
+        return None
+    if info.get("Type", "Application") != "Application":
+        return None
+    if info.get("NoDisplay", "false").lower() == "true":
+        return None
+    if info.get("Hidden", "false").lower() == "true":
+        return None
+    if not info.get("Name") or not info.get("Exec"):
+        return None
+    clean = FIELD_CODES.sub("", info["Exec"]).strip()
+    # Drop flatpak/spawn wrappers? No — keep full command, it just works.
+    return {"name": info["Name"], "exec": clean,
+            "comment": info.get("Comment", ""),
+            "icon": info.get("Icon", ""),
+            "terminal": info.get("Terminal", "false").lower() == "true",
+            "file": path}
+
+
+def cmd_apps():
+    seen = set()
+    apps = []
+    for d in DESKTOP_DIRS:
+        for path in sorted(glob.glob(os.path.join(d, "*.desktop"))):
+            app = parse_desktop(path)
+            if not app:
+                continue
+            key = (app["name"], app["exec"])
+            if key in seen:
+                continue
+            seen.add(key)
+            apps.append(app)
+    apps.sort(key=lambda a: a["name"].lower())
+    return ok(apps)
+
+
+# ---------------------------------------------------------------- create
+
+def valid_name(name):
+    return bool(name) and bool(NAME_RE.match(name)) and len(name) <= 64
+
+
+def cmd_create(argv):
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--name", required=True)
+    ap.add_argument("--desc", default="")
+    ap.add_argument("--kind", required=True,
+                    choices=("app", "command", "appimage"))
+    ap.add_argument("--exec", required=True)
+    ap.add_argument("--boot", default="yes", choices=("yes", "no"))
+    ap.add_argument("--restart", default="yes", choices=("yes", "no"))
+    ap.add_argument("--watchdog", default="no", choices=("yes", "no"))
+    ap.add_argument("--terminal", default="no", choices=("yes", "no"))
+    try:
+        ns = ap.parse_args(argv)
+    except SystemExit:
+        return fail("Bad create arguments")
+    name = ns.name.strip()
+    if name.endswith(".service"):
+        name = name[:-8]
+    if not valid_name(name):
+        return fail("Name may only use letters, numbers, dot, dash, underscore")
+    target = os.path.join(USER_UNIT_DIR, name + ".service")
+    if os.path.exists(target):
+        return fail("A service called '%s' already exists" % name)
+
+    exec_cmd = ns.exec.strip()
+    if not exec_cmd:
+        return fail("Nothing to run — the command is empty")
+    if ns.kind == "appimage":
+        # Make double-clickable downloads actually runnable.
+        try:
+            st = os.stat(exec_cmd)
+            if not (st.st_mode & 0o111):
+                os.chmod(exec_cmd, st.st_mode | 0o755)
+        except OSError:
+            pass
+        if not os.path.isfile(exec_cmd):
+            return fail("AppImage file not found: %s" % exec_cmd)
+        exec_start = shlex.quote(exec_cmd)
+    elif ns.terminal == "yes":
+        exec_start = "xdg-terminal-exec -e " + " ".join(
+            shlex.quote(p) for p in shlex.split(exec_cmd))
+    else:
+        exec_start = " ".join(shlex.quote(p) for p in shlex.split(exec_cmd))
+        if not exec_start:
+            return fail("Nothing to run — the command is empty")
+
+    desc = ns.desc.strip() or ("My %s service (%s)"
+                               % (ns.kind, name))
+    gui = ns.kind in ("app", "appimage")
+
+    lines = [
+        "# %s systemd-ease (created by the Systemd Ease omarchy plugin)" % MARKER,
+        "# kind=%s watchdog=%s" % (ns.kind, ns.watchdog),
+        "[Unit]",
+        "Description=%s" % desc,
+    ]
+    if gui:
+        lines += ["After=graphical-session.target",
+                  "PartOf=graphical-session.target"]
+    else:
+        lines += ["After=default.target"]
+    lines += ["", "[Service]", "Type=simple",
+              "ExecStart=%s" % exec_start]
+    if ns.restart == "yes" or ns.watchdog == "yes":
+        lines += ["Restart=on-failure", "RestartSec=5"]
+    else:
+        lines += ["Restart=no"]
+    lines += ["", "[Install]"]
+    if gui:
+        lines += ["WantedBy=graphical-session.target"]
+    else:
+        lines += ["WantedBy=default.target"]
+    lines += [""]
+
+    try:
+        os.makedirs(USER_UNIT_DIR, exist_ok=True)
+        with open(target, "w") as f:
+            f.write("\n".join(lines))
+    except OSError as e:
+        return fail("Could not write unit file: %s" % e)
+
+    run(["systemctl", "--user", "daemon-reload"])
+    result = {"ok": True, "unit": name + ".service", "file": target,
+              "watchdog": ns.watchdog == "yes", "docs": ""}
+    if ns.boot == "yes":
+        e = run(["systemctl", "--user", "enable", name + ".service"])
+        result["boot"] = (e.returncode == 0)
+    else:
+        result["boot"] = False
+    s = run(["systemctl", "--user", "start", name + ".service"])
+    # `start` only means systemd accepted the job — the process may still
+    # crash a second later. Re-check so the UI can say so honestly.
+    time.sleep(2)
+    st = run(["systemctl", "--user", "is-active", name + ".service"])
+    fl = run(["systemctl", "--user", "is-failed", name + ".service"])
+    state_now = (st.stdout or "").strip()
+    show_now = run(["systemctl", "--user", "show", name + ".service",
+                    "--property=Result", "--no-pager"])
+    m_now = re.search(r"Result=(.*)", show_now.stdout or "")
+    result_now = (m_now.group(1) if m_now else "").strip()
+    crashed = (fl.returncode == 0 and (fl.stdout or "").strip() == "failed")
+    result["started"] = (s.returncode == 0 and state_now == "active"
+                         and not crashed)
+    if s.returncode != 0:
+        result["startError"] = ((s.stderr or "").strip().splitlines()
+                                or ["could not start"])[0][:200]
+    elif crashed:
+        result["startError"] = ("it failed (result=%s) — the watchdog diary "
+                                "has the details" % (result_now or "?"))
+    elif crashed_result(result_now):
+        result["startError"] = ("it keeps crashing on launch (result=%s)"
+                                % result_now)
+    elif state_now != "active":
+        result["startError"] = "it is '%s' right now, not running" % state_now
+
+    if ns.watchdog == "yes":
+        w = setup_watchdog(name, desc, exec_start)
+        result["docs"] = w.get("docs", "")
+        result["watchdogTimer"] = w.get("timer", "")
+
+    if not result["started"]:
+        where = ("open %s and hand it to your AI agent"
+                 % result["docs"] if result["docs"]
+                 else "open Logs to see why")
+        result["message"] = ("Created, but it crashed right away "
+                             "(%s). %s."
+                             % (result.get("startError", "see logs"), where))
+    else:
+        result["message"] = "Service %s is running" % (name + ".service")
+    return ok(result)
+
+
+def setup_watchdog(name, desc, exec_start):
+    """Companion per-minute checker + human-readable debug folder."""
+    docs = os.path.join(DOCS_DIR, name)
+    datafile = os.path.join(docs, "watchdogdata.txt")
+    timer_name = name + "-watchdog.timer"
+    svc_name = name + "-watchdog.service"
+    bridge = os.path.abspath(__file__)
+    try:
+        os.makedirs(docs, exist_ok=True)
+        header = [
+            "Watchdog data for '%s'" % (name + ".service"),
+            "=" * 60,
+            "Created : %s" % datetime.now().isoformat(timespec="seconds"),
+            "Runs    : %s" % exec_start,
+            "Why this folder exists: you asked for a watchdog when creating",
+            "this service. Every minute a checker appends the service state",
+            "and recent logs below. If the service misbehaves: stop it, open",
+            "this file, and hand it to your AI agent — it has everything the",
+            "agent needs to tell you what went wrong.",
+            "",
+            "-" * 60,
+            "",
+        ]
+        with open(datafile, "w") as f:
+            f.write("\n".join(header))
+            f.write(status_snapshot(name))
+            f.write("\n")
+        svc = [
+            "[Unit]",
+            "Description=Watchdog checker for %s (systemd-ease)" % name,
+            "",
+            "[Service]",
+            "Type=oneshot",
+            "ExecStart=%s watchdog-check %s" % (
+                shlex.quote(bridge), shlex.quote(name)),
+            "",
+        ]
+        tmr = [
+            "[Unit]",
+            "Description=Watchdog timer for %s (systemd-ease)" % name,
+            "",
+            "[Timer]",
+            "OnCalendar=minutely",
+            "Persistent=false",
+            "",
+            "[Install]",
+            "WantedBy=timers.target",
+            "",
+        ]
+        with open(os.path.join(USER_UNIT_DIR, svc_name), "w") as f:
+            f.write("\n".join(svc))
+        with open(os.path.join(USER_UNIT_DIR, timer_name), "w") as f:
+            f.write("\n".join(tmr))
+        run(["systemctl", "--user", "daemon-reload"])
+        run(["systemctl", "--user", "enable", "--now", timer_name])
+    except OSError as e:
+        return {"docs": datafile, "timer": timer_name,
+                "error": "watchdog setup incomplete: %s" % e}
+    return {"docs": datafile, "timer": timer_name}
+
+
+def status_snapshot(name):
+    unit = name if name.endswith((".service", ".timer")) else name + ".service"
+    a = run(["systemctl", "--user", "is-active", unit])
+    e = run(["systemctl", "--user", "is-enabled", unit])
+    s = run(["systemctl", "--user", "status", unit, "--no-pager", "--lines=5"])
+    out = ["[snapshot %s]" % datetime.now().isoformat(timespec="seconds"),
+           "active: %s   boot: %s" % ((a.stdout or "").strip(),
+                                      (e.stdout or "").strip()),
+           (s.stdout or "").strip(),
+           "--- last 30 log lines ---",
+           journal_lines(unit, "user", 30)]
+    return "\n".join(out) + "\n"
+
+
+def crashed_result(result):
+    return result not in ("", "success")
+
+
+def cmd_watchdog_check(name):
+    unit = name if name.endswith(".service") else name + ".service"
+    base = unit[:-8]
+    datafile = os.path.join(DOCS_DIR, base, "watchdogdata.txt")
+    if not os.path.isfile(datafile):
+        return fail("No watchdog folder for %s (was it created with watchdog=yes?)"
+                    % unit)
+    try:
+        # Keep the file bounded so it stays easy to share with an agent.
+        if os.path.getsize(datafile) > 200_000:
+            with open(datafile, "r", errors="replace") as f:
+                tail = f.read().splitlines()[-400:]
+            with open(datafile, "w") as f:
+                f.write("(trimmed to last 400 lines)\n" + "\n".join(tail) + "\n")
+        with open(datafile, "a") as f:
+            f.write("\n" + status_snapshot(base))
+            a = run(["systemctl", "--user", "is-active", unit])
+            state = (a.stdout or "").strip()
+            show = run(["systemctl", "--user", "show", unit,
+                        "--property=Result,NRestarts", "--no-pager"])
+            props = dict(
+                (l.split("=", 1) + [""])[:2]
+                for l in (show.stdout or "").splitlines() if "=" in l)
+            nrestarts = props.get("NRestarts", "0")
+            if state == "active":
+                f.write("watchdog: healthy\n")
+            elif crashed_result(props.get("Result", "")):
+                f.write("watchdog: CRASHING (result=%s, restarts=%s) — "
+                        "this is the part to show your AI agent\n"
+                        % (props.get("Result", "?"), nrestarts))
+            elif state in ("activating", "reloading"):
+                f.write("watchdog: still starting (restarts=%s)\n" % nrestarts)
+            else:
+                e = run(["systemctl", "--user", "is-enabled", unit])
+                if (e.stdout or "").strip() == "enabled":
+                    r = run(["systemctl", "--user", "restart", unit])
+                    f.write("watchdog: tried restart, result=%s\n"
+                            % ("ok" if r.returncode == 0 else "failed"))
+                else:
+                    f.write("watchdog: service not running, left stopped "
+                            "(boot is off)\n")
+    except OSError as e:
+        return fail("Could not update watchdog file: %s" % e)
+    return ok({"ok": True, "unit": unit, "file": datafile})
+
+
+def cmd_watchdog_log(name):
+    base = name[:-8] if name.endswith(".service") else name
+    datafile = os.path.join(DOCS_DIR, base, "watchdogdata.txt")
+    try:
+        with open(datafile, "r", errors="replace") as f:
+            sys.stdout.write(f.read())
+    except OSError:
+        sys.stdout.write("No watchdog data yet for %s.\n" % base)
+    return 0
+
+
+# ---------------------------------------------------------------- delete
+
+def cmd_delete(unit, scope):
+    if scope not in VALID_SCOPES:
+        return fail("Scope must be system or user")
+    if not unit.endswith((".service", ".timer")):
+        return fail("Only service/timer units can be deleted")
+    base = unit[:-8] if unit.endswith(".service") else unit[:-6]
+    args = scope_args(scope)
+
+    # Find the real file so vendor units can never be removed.
+    frag = ""
+    p = run(["systemctl"] + args + ["show", unit, "--property=FragmentPath",
+                                    "--no-pager"])
+    if p.returncode == 0:
+        m = re.search(r"FragmentPath=(.*)", p.stdout or "")
+        frag = (m.group(1) if m else "").strip()
+    if not frag:
+        # Maybe an unmanaged user file that was never loaded.
+        guess = os.path.join(USER_UNIT_DIR, unit) if scope == "user" else ""
+        if guess and os.path.isfile(guess):
+            frag = guess
+    if not frag:
+        return fail("Unit file not found — nothing to delete")
+    if frag.startswith("/usr/"):
+        return fail("That is a preinstalled system service and cannot be "
+                    "deleted (you can still Stop it or turn Boot off)")
+    if not (frag.startswith("/etc/") or frag.startswith(HOME)):
+        return fail("Refusing to delete unexpected location: %s" % frag)
+
+    elev = scope == "system" or frag.startswith("/etc/")
+    prefix = (["pkexec"] if elev and os.geteuid() != 0 else [])
+
+    def priv(cmd):
+        """Run, escalating once through pkexec when needed."""
+        r = run(cmd)
+        if r.returncode != 0 and not prefix:
+            err = (r.stderr or "").lower()
+            if any(h in err for h in AUTH_HINTS):
+                r = run(["pkexec"] + cmd)
+        elif r.returncode != 0 and prefix:
+            r = run(prefix + cmd)
+        return r
+
+    run(["systemctl"] + args + ["stop", unit])
+    run(["systemctl"] + args + ["disable", unit])
+    # Remove watchdog companions for managed units.
+    if scope == "user":
+        for extra in (base + "-watchdog.timer", base + "-watchdog.service"):
+            run(["systemctl", "--user", "stop", extra])
+            run(["systemctl", "--user", "disable", extra])
+            try:
+                p2 = os.path.join(USER_UNIT_DIR, extra)
+                if os.path.isfile(p2):
+                    os.remove(p2)
+            except OSError:
+                pass
+    r = priv(["rm", "-f", frag])
+    if r.returncode != 0:
+        return fail("Could not remove unit file (password may be needed)")
+    priv(["systemctl"] + args + ["daemon-reload"])
+    return ok({"ok": True, "unit": unit,
+               "message": "%s deleted" % unit,
+               "docsKept": os.path.join(DOCS_DIR, base)})
+
+
+# ---------------------------------------------------------------- blame
+
+def cmd_blame(user=False):
+    args = ["systemd-analyze"]
+    if user:
+        args.append("--user")
+    args += ["blame", "--no-pager"]
+    p = run(args, timeout=20)
+    lines = (p.stdout or p.stderr or "No data").splitlines()[:15]
+    t = run(["systemd-analyze"] + (["--user"] if user else []) + ["time", "--no-pager"])
+    head = (t.stdout or "").strip().splitlines()
+    sys.stdout.write("\n".join(head + [""] + lines) + "\n")
+    return 0
+
+
+# ---------------------------------------------------------------- main
+
+def usage():
+    sys.stderr.write(__doc__ + "\n")
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        usage()
+        return 0
+    cmd = argv[0]
+    rest = argv[1:]
+    if cmd == "list":
+        return cmd_list()
+    if cmd == "failed-count":
+        return cmd_failed_count()
+    if cmd == "action" and len(rest) == 3:
+        return cmd_action(rest[0], rest[1], rest[2])
+    if cmd == "status" and len(rest) == 2:
+        return cmd_status(rest[0], rest[1])
+    if cmd == "logs" and 2 <= len(rest) <= 3:
+        return cmd_logs(rest[0], rest[1], *(rest[2:] or ["200"]))
+    if cmd == "save-logs" and len(rest) == 3:
+        return cmd_save_logs(rest[0], rest[1], rest[2])
+    if cmd == "apps":
+        return cmd_apps()
+    if cmd == "create":
+        return cmd_create(rest)
+    if cmd == "delete" and len(rest) == 2:
+        return cmd_delete(rest[0], rest[1])
+    if cmd == "watchdog-check" and len(rest) == 1:
+        return cmd_watchdog_check(rest[0])
+    if cmd == "watchdog-log" and len(rest) == 1:
+        return cmd_watchdog_log(rest[0])
+    if cmd == "blame":
+        return cmd_blame(user=(len(rest) == 1 and rest[0] == "--user"))
+    sys.stderr.write("Unknown command. See --help.\n")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

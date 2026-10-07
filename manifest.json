@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.proadmin.systemd-ease",
+  "name": "Systemd Ease",
+  "version": "1.0.0",
+  "author": "local",
+  "license": "MIT",
+  "description": "Manage systemd services the easy way: search, filter, start/stop, boot toggle, logs, boot-time view, and a guided creator with optional watchdog.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Systemd Ease",
+    "description": "Start, stop and create systemd services",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

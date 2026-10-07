@@ -1,0 +1,32 @@
+Systemd Ease v1.0.0 — for Omarchy
+====================================
+
+WHAT THIS IS
+A plugin for the Omarchy bar that manages systemd services in plain words:
+search, filter (Everything / Mine+added / Preinstalled), Start/Stop, a Boot
+toggle, logs, boot-time view, and a 3-step service creator with an optional
+crash watchdog (diary lands in ~/Documents/<name>/watchdogdata.txt).
+
+INSTALL (on any Omarchy machine, 1 minute)
+1. Copy this whole folder somewhere, e.g. ~/Projects/systemd-ease
+2. cd into it and run:  ./install.sh
+3. When it says so, run:  omarchy restart shell   (one time only)
+4. Click the cog icon in the bar. Done.
+
+Update later by re-running ./install.sh (services/watchdogs untouched).
+Remove with ./uninstall.sh.
+
+FILES
+  install.sh / uninstall.sh .. one-command setup / removal
+  manifest.json .............. plugin contract (id: io.github.proadmin.systemd-ease)
+  BarWidget.qml .............. bar icon + crash badge
+  Panel.qml .................. service list / logs / boot-times
+  Wizard.qml ................. guided service creator
+  Model.js ................... filter + wording helpers
+  bin/systemd-ease ........... backend (python3, stdlib only)
+  README.md .................. full documentation
+  LICENSE .................... MIT
+
+REQUIREMENTS
+Omarchy Quattro, systemctl, journalctl, python3, wl-copy, xdg-open.
+System changes may ask for your password once via the normal polkit dialog.
