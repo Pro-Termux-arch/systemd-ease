@@ -8,6 +8,10 @@ No terminal needed. No unit-file syntax to memorize.
 
 ## Install (one command)
 
+for automatic install (easier) just copy this and paste this in the terminal --> ```omarchy plugin add https://github.com/Pro-Termux-arch/systemd-ease.git --enable   ```
+
+or if you are a more like manual user just git clone this, cd into it and then follow these steps
+
 ```sh
 ./install.sh
 ```
